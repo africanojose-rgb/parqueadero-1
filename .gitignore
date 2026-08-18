@@ -1,0 +1,13 @@
+# Datos y artefactos generados (contienen PII de clientes y estado local)
+parqueadero.db
+*.db
+tickets/
+reportes_cierre/
+
+# Entorno virtual
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/

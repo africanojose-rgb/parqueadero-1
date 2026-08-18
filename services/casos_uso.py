@@ -1,0 +1,209 @@
+from __future__ import annotations
+
+from datetime import datetime
+
+from domain import enums, reglas
+from domain.entities import ConfiguracionVehiculo
+from infrastructure import repos
+from infrastructure.archivos import generar_cierre_caja, generar_ticket
+from services.exceptions import ConfiguracionFaltante, ValidacionError
+
+_ingreso_repo = repos.IngresoRepo()
+_mensualidad_repo = repos.MensualidadRepo()
+_config_repo = repos.ConfiguracionRepo()
+_cierre_repo = repos.CierreRepo()
+
+
+def _validar_placa(placa: str) -> str:
+    placa = (placa or "").strip().upper()
+    if not placa:
+        raise ValidacionError("La placa es obligatoria.")
+    return placa
+
+
+def registrar_entrada(placa, tipo, marca, propietario, telefono):
+    placa = _validar_placa(placa)
+    if not tipo:
+        raise ValidacionError("Debe seleccionar un tipo de vehículo.")
+    return _ingreso_repo.registrar_entrada(placa, tipo, marca or "", propietario or "", telefono or "")
+
+
+def buscar_placa(placa):
+    return _ingreso_repo.buscar_en_sitio(_validar_placa(placa))
+
+
+def previsualizar_cobro(placa) -> dict:
+    ingreso = _ingreso_repo.buscar_en_sitio(_validar_placa(placa))
+    if not ingreso:
+        raise ValidacionError("Vehículo no encontrado en sitio.")
+    cfg = _config_repo.obtener(ingreso.tipo)
+    tarifa = cfg.tarifa_hora if cfg else 0.0
+    ahora = datetime.now()
+    horas = reglas.calcular_horas(ingreso.entrada, ahora)
+    total = horas * tarifa
+    return {
+        "id": ingreso.id,
+        "placa": ingreso.placa,
+        "tipo": ingreso.tipo,
+        "marca": ingreso.marca,
+        "entrada": ingreso.entrada.strftime("%Y-%m-%d %H:%M:%S"),
+        "horas": horas,
+        "tarifa": tarifa,
+        "total": total,
+    }
+
+
+def cobrar_salida(placa) -> dict:
+    cobro = previsualizar_cobro(placa)
+    salida = datetime.now()
+    _ingreso_repo.finalizar(cobro["id"], salida, cobro["total"])
+    ticket = generar_ticket(
+        cobro["placa"], cobro["tipo"], cobro["entrada"], salida.strftime("%Y-%m-%d %H:%M:%S"),
+        cobro["horas"], cobro["total"],
+    )
+    return {**cobro, "ticket": str(ticket)}
+
+
+def _precio_mensual(tipo: str) -> float:
+    cfg = _config_repo.obtener(tipo)
+    if not cfg:
+        raise ConfiguracionFaltante(
+            f"No hay configuración de precio para '{tipo}'."
+        )
+    return float(cfg.tarifa_mes)
+
+
+def registrar_mensualidad(placa, marca, propietario, telefono, tipo) -> dict:
+    placa = _validar_placa(placa)
+    if tipo not in {t.value for t in enums.TIPOS_MENSUALES}:
+        raise ValidacionError("Tipo de mensualidad no válido.")
+    precio = _precio_mensual(tipo)
+    ahora = datetime.now()
+    venc = reglas.fecha_vencimiento(ahora)
+    _mensualidad_repo.registrar(placa, marca or "", propietario or "", telefono or "", tipo, ahora, venc)
+    _ingreso_repo.registrar_pago_mes(placa, marca or "", propietario or "", tipo, ahora, precio)
+    return {"placa": placa, "precio": precio, "vencimiento": venc.strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def renovar_mensualidad(placa) -> dict:
+    placa = _validar_placa(placa)
+    m = _mensualidad_repo.obtener_por_placa(placa)
+    if not m:
+        raise ValidacionError("No existe mensualidad para esa placa.")
+    precio = _precio_mensual(m.tipo)
+    ahora = datetime.now()
+    base = max(ahora, m.fecha_vencimiento)
+    nueva_f = reglas.fecha_vencimiento(base)
+    _mensualidad_repo.renovar(placa, ahora, nueva_f)
+    _ingreso_repo.registrar_pago_mes(placa, m.marca, m.propietario, enums.TipoPago.RENOVACION_MES.value, ahora, precio)
+    return {"placa": placa, "precio": precio, "vencimiento": nueva_f.strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def eliminar_mensualidad(placa) -> None:
+    _mensualidad_repo.eliminar(_validar_placa(placa))
+
+
+def listar_mensualidades() -> list[dict]:
+    hoy = datetime.now()
+    resultado = []
+    for m in _mensualidad_repo.listar():
+        tag = reglas.clasificar_vencimiento(m.fecha_vencimiento, hoy)
+        resultado.append(
+            {
+                "placa": m.placa,
+                "marca": m.marca,
+                "propietario": m.propietario,
+                "telefono": m.telefono,
+                "vencimiento": m.fecha_vencimiento.strftime("%Y-%m-%d %H:%M:%S"),
+                "tipo": m.tipo,
+                "tag": tag,
+            }
+        )
+    return resultado
+
+
+def listar_en_sitio() -> list[dict]:
+    return [
+        {
+            "placa": i.placa,
+            "marca": i.marca,
+            "tipo": i.tipo,
+            "propietario": i.propietario,
+            "entrada": i.entrada.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        for i in _ingreso_repo.listar_en_sitio()
+    ]
+
+
+def obtener_resumen_cierre() -> dict:
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    resumen = _ingreso_repo.resumen_dia(hoy)
+    en_sitio = _ingreso_repo.listar_en_sitio()
+    inventario = [(i.placa, i.tipo, i.entrada.strftime("%Y-%m-%d %H:%M:%S")) for i in en_sitio]
+    total = resumen["horas_total"] + resumen["mes_total"]
+    return {
+        **resumen,
+        "fecha": hoy,
+        "total": total,
+        "vehiculos_salida": resumen["horas_count"] + resumen["mes_count"],
+        "inventario": inventario,
+    }
+
+
+def confirmar_cierre() -> dict:
+    resumen = obtener_resumen_cierre()
+    _cierre_repo.registrar(resumen["fecha"], resumen["total"], resumen["vehiculos_salida"])
+    generar_cierre_caja(resumen["fecha"], resumen["horas_total"], resumen["inventario"])
+    return resumen
+
+
+def ventas_hoy() -> float:
+    return _ingreso_repo.sumar_valor_pagado_hoy(datetime.now().strftime("%Y-%m-%d"))
+
+
+def obtener_configuracion() -> list[ConfiguracionVehiculo]:
+    return _config_repo.obtener_todas()
+
+
+def guardar_configuracion(tipo, tarifa_hora, tarifa_mes, cupos) -> None:
+    if not tipo:
+        raise ValidacionError("Debe seleccionar un tipo de vehículo.")
+    try:
+        th = float(tarifa_hora)
+        tm = float(tarifa_mes)
+        cup = int(cupos)
+    except (TypeError, ValueError):
+        raise ValidacionError("Los valores de precio y cupo deben ser numéricos.")
+    if th < 0 or tm < 0 or cup < 0:
+        raise ValidacionError("Los valores no pueden ser negativos.")
+    _config_repo.guardar(ConfiguracionVehiculo(tipo, th, tm, cup))
+
+
+def calcular_ocupacion() -> dict:
+    """Conteo de ocupación real para las tarjetas del dashboard."""
+    conf = {c.tipo: c for c in _config_repo.obtener_todas()}
+    ocupacion_hora = _ingreso_repo.contar_en_sitio_por_tipo()
+    mensuales = _mensualidad_repo.listar()
+    ocupacion_mes = {}
+    for m in mensuales:
+        ocupacion_mes[m.tipo] = ocupacion_mes.get(m.tipo, 0) + 1
+
+    def ocupado(tipo):
+        return ocupacion_hora.get(tipo, 0)
+
+    def cupos(tipo):
+        return conf.get(tipo).cupos_totales if conf.get(tipo) else 0
+
+    return {
+        "moto_hora": (ocupado("Moto Hora"), cupos("Moto Hora")),
+        "moto_mes": (ocupacion_mes.get("Moto Mes", 0), cupos("Moto Mes")),
+        "otros": (
+            ocupado("Carro") + ocupado("Camion") + ocupado("Autobus"),
+            cupos("Carro") + cupos("Camion") + cupos("Autobus"),
+        ),
+        "alertas_mes": sum(
+            1
+            for m in mensuales
+            if reglas.clasificar_vencimiento(m.fecha_vencimiento, datetime.now()) != "ok"
+        ),
+    }
