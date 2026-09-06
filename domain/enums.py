@@ -39,6 +39,12 @@ class TipoPago(str, Enum):
     RENOVACION_MES = "RENOVACIÓN MES"
 
 
+class EstadoReporte(str, Enum):
+    PENDIENTE = "PENDIENTE"
+    GENERADO = "GENERADO"
+    ERROR = "ERROR"
+
+
 def es_mensual(tipo: str) -> bool:
     return tipo in {t.value for t in TIPOS_MENSUALES} or tipo in {
         TipoPago.PAGO_MES.value,

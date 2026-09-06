@@ -3,10 +3,18 @@ from __future__ import annotations
 from datetime import datetime
 
 from domain import enums, reglas
+from domain.enums import EstadoReporte
 from domain.entities import ConfiguracionVehiculo
 from infrastructure import repos
 from infrastructure.archivos import generar_cierre_caja, generar_ticket
-from services.exceptions import ConfiguracionFaltante, ValidacionError
+from services.exceptions import (
+    CierreDiarioYaExiste,
+    CierreNoEncontrado,
+    CierreSinSnapshot,
+    ConfiguracionFaltante,
+    IngresoActivoDuplicado,
+    ValidacionError,
+)
 
 _ingreso_repo = repos.IngresoRepo()
 _mensualidad_repo = repos.MensualidadRepo()
@@ -25,7 +33,18 @@ def registrar_entrada(placa, tipo, marca, propietario, telefono):
     placa = _validar_placa(placa)
     if not tipo:
         raise ValidacionError("Debe seleccionar un tipo de vehículo.")
-    return _ingreso_repo.registrar_entrada(placa, tipo, marca or "", propietario or "", telefono or "")
+    if _ingreso_repo.existe_en_sitio(placa):
+        raise IngresoActivoDuplicado(
+            f"La placa '{placa}' ya tiene un ingreso activo en el parqueadero."
+        )
+    try:
+        return _ingreso_repo.registrar_entrada(
+            placa, tipo, marca or "", propietario or "", telefono or ""
+        )
+    except repos.IngresoActivoDuplicadoPersistenceError as exc:
+        raise IngresoActivoDuplicado(
+            f"La placa '{placa}' ya tiene un ingreso activo en el parqueadero."
+        ) from exc
 
 
 def buscar_placa(placa):
@@ -150,11 +169,143 @@ def obtener_resumen_cierre() -> dict:
     }
 
 
+def _marcar_reporte_generado(cierre_id: int) -> None:
+    actualizado = _cierre_repo.actualizar_estado_reporte_condicional(
+        cierre_id,
+        EstadoReporte.GENERADO,
+    )
+    if actualizado:
+        return
+    cierre_actual = _cierre_repo.obtener_por_id(cierre_id)
+    if cierre_actual and cierre_actual.estado_reporte == EstadoReporte.GENERADO:
+        return
+    raise ValidacionError(
+        f"El reporte del cierre '{cierre_id}' fue publicado, "
+        "pero no se pudo confirmar el estado GENERADO en SQLite "
+        "(no se pudo confirmar la operación)."
+    )
+
+
+def _marcar_reporte_error(cierre_id: int, error_original: Exception) -> None:
+    actualizado = _cierre_repo.actualizar_estado_reporte_condicional(
+        cierre_id,
+        EstadoReporte.ERROR,
+    )
+    if actualizado:
+        return
+    cierre_actual = _cierre_repo.obtener_por_id(cierre_id)
+    if cierre_actual and cierre_actual.estado_reporte == EstadoReporte.GENERADO:
+        return
+    raise ValidacionError(
+        f"No se pudo persistir el estado ERROR del cierre '{cierre_id}'."
+    )
+
+
 def confirmar_cierre() -> dict:
     resumen = obtener_resumen_cierre()
-    _cierre_repo.registrar(resumen["fecha"], resumen["total"], resumen["vehiculos_salida"])
-    generar_cierre_caja(resumen["fecha"], resumen["horas_total"], resumen["inventario"])
+    fecha = resumen["fecha"]
+    if _cierre_repo.existe_por_fecha(fecha):
+        raise CierreDiarioYaExiste(f"Ya existe un cierre para la fecha '{fecha}'.")
+    try:
+        cierre = _cierre_repo.registrar(
+            fecha,
+            resumen["total"],
+            resumen["vehiculos_salida"],
+            total_horas=resumen["horas_total"],
+            cantidad_horas=resumen["horas_count"],
+            total_mensualidades=resumen["mes_total"],
+            cantidad_mensualidades=resumen["mes_count"],
+            inventario_snapshot=resumen["inventario"],
+            estado_reporte=EstadoReporte.PENDIENTE,
+        )
+    except repos.CierreDiarioDuplicadoPersistenceError as exc:
+        raise CierreDiarioYaExiste(f"Ya existe un cierre para la fecha '{fecha}'.") from exc
+    try:
+        generar_cierre_caja(
+            resumen["fecha"],
+            resumen["horas_total"],
+            resumen["horas_count"],
+            resumen["mes_total"],
+            resumen["mes_count"],
+            resumen["total"],
+            resumen["inventario"],
+        )
+    except Exception as error_generacion:
+        try:
+            _marcar_reporte_error(cierre.id, error_generacion)
+        except Exception as error_estado:
+            error_generacion.add_note(
+                f"No se pudo persistir ERROR para el cierre {cierre.id}: {error_estado}"
+            )
+        raise
+    _marcar_reporte_generado(cierre.id)
     return resumen
+
+
+def _validar_cierre_recuperable(cierre) -> None:
+    campos_obligatorios = (
+        "fecha",
+        "total",
+        "vehiculos_salida",
+        "total_horas",
+        "cantidad_horas",
+        "total_mensualidades",
+        "cantidad_mensualidades",
+        "inventario_snapshot",
+    )
+    if any(getattr(cierre, campo) is None for campo in campos_obligatorios):
+        raise CierreSinSnapshot(
+            f"El cierre '{cierre.id}' no tiene datos históricos completos."
+        )
+    if not isinstance(cierre.inventario_snapshot, list):
+        raise CierreSinSnapshot(
+            f"El snapshot del cierre '{cierre.id}' no tiene un formato válido."
+        )
+    for item in cierre.inventario_snapshot:
+        if (
+            not isinstance(item, (tuple, list))
+            or len(item) != 3
+            or any(not isinstance(valor, str) or not valor for valor in item)
+        ):
+            raise CierreSinSnapshot(
+                f"El snapshot del cierre '{cierre.id}' no tiene un formato válido."
+            )
+
+
+def recuperar_reporte_cierre(cierre_id: int):
+    try:
+        cierre = _cierre_repo.obtener_por_id(cierre_id)
+    except repos.CierreSnapshotInvalidoPersistenceError as exc:
+        raise CierreSinSnapshot(
+            f"El cierre '{cierre_id}' no tiene un snapshot válido."
+        ) from exc
+    if not cierre:
+        raise CierreNoEncontrado(f"No existe el cierre '{cierre_id}'.")
+    if cierre.estado_reporte not in (EstadoReporte.PENDIENTE, EstadoReporte.ERROR):
+        raise ValidacionError(
+            f"El cierre '{cierre_id}' no está disponible para recuperación."
+        )
+    _validar_cierre_recuperable(cierre)
+    try:
+        archivo = generar_cierre_caja(
+            cierre.fecha,
+            cierre.total_horas,
+            cierre.cantidad_horas,
+            cierre.total_mensualidades,
+            cierre.cantidad_mensualidades,
+            cierre.total,
+            cierre.inventario_snapshot,
+        )
+    except Exception as error_generacion:
+        try:
+            _marcar_reporte_error(cierre.id, error_generacion)
+        except Exception as error_estado:
+            error_generacion.add_note(
+                f"No se pudo persistir ERROR para el cierre {cierre.id}: {error_estado}"
+            )
+        raise
+    _marcar_reporte_generado(cierre.id)
+    return archivo
 
 
 def ventas_hoy() -> float:

@@ -28,3 +28,10 @@ def _limpiar_datos():
             "DELETE FROM ingresos; DELETE FROM mensualidades; DELETE FROM cierres_caja;"
         )
     yield
+
+
+@pytest.fixture(autouse=True)
+def _aislar_tickets(tmp_path, monkeypatch):
+    from infrastructure import archivos
+
+    monkeypatch.setattr(archivos, "TICKETS_DIR", tmp_path / "tickets")

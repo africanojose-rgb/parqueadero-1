@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from datetime import datetime
 
 from domain.entities import (
@@ -8,11 +10,23 @@ from domain.entities import (
     Ingreso,
     Mensualidad,
 )
-from domain.enums import EstadoIngreso, TipoPago
+from domain.enums import EstadoIngreso, EstadoReporte, TipoPago
 from infrastructure import db
 from infrastructure._dt import fmt, parse
 
 TIPOS_PAGO_MES = {TipoPago.PAGO_MES.value, TipoPago.RENOVACION_MES.value}
+
+
+class IngresoActivoDuplicadoPersistenceError(Exception):
+    """La base rechazó una placa ya presente como ingreso activo."""
+
+
+class CierreDiarioDuplicadoPersistenceError(Exception):
+    """La base rechazó un cierre para una fecha ya registrada."""
+
+
+class CierreSnapshotInvalidoPersistenceError(Exception):
+    """El snapshot persistido de un cierre no tiene un formato válido."""
 
 
 class ConfiguracionRepo:
@@ -54,26 +68,42 @@ class ConfiguracionRepo:
 
 
 class IngresoRepo:
+    def existe_en_sitio(self, placa: str) -> bool:
+        with db.get_connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM ingresos WHERE placa=? AND estado=? LIMIT 1",
+                (placa.upper(), EstadoIngreso.EN_SITIO.value),
+            ).fetchone()
+        return row is not None
+
     def registrar_entrada(
         self, placa: str, tipo: str, marca: str, propietario: str, telefono: str
     ) -> Ingreso:
         entrada = datetime.now()
-        with db.get_connection() as conn:
-            cur = conn.execute(
-                """INSERT INTO ingresos
-                   (placa, tipo, marca, propietario, telefono, entrada, estado)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (
-                    placa.upper(),
-                    tipo,
-                    marca.upper(),
-                    propietario,
-                    telefono,
-                    fmt(entrada),
-                    EstadoIngreso.EN_SITIO.value,
-                ),
-            )
-            id_ = cur.lastrowid
+        try:
+            with db.get_connection() as conn:
+                cur = conn.execute(
+                    """INSERT INTO ingresos
+                       (placa, tipo, marca, propietario, telefono, entrada, estado)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (
+                        placa.upper(),
+                        tipo,
+                        marca.upper(),
+                        propietario,
+                        telefono,
+                        fmt(entrada),
+                        EstadoIngreso.EN_SITIO.value,
+                    ),
+                )
+                id_ = cur.lastrowid
+        except sqlite3.IntegrityError as exc:
+            if (
+                exc.sqlite_errorname == "SQLITE_CONSTRAINT_UNIQUE"
+                and "ingresos.placa" in str(exc)
+            ):
+                raise IngresoActivoDuplicadoPersistenceError from exc
+            raise
         return Ingreso(id_, placa.upper(), tipo, marca.upper(), propietario,
                        telefono, entrada, None, 0.0, EstadoIngreso.EN_SITIO)
 
@@ -238,11 +268,128 @@ class MensualidadRepo:
 
 
 class CierreRepo:
-    def registrar(self, fecha: str, total: float, vehiculos_salida: int) -> CierreCaja:
+    def existe_por_fecha(self, fecha: str) -> bool:
         with db.get_connection() as conn:
-            cur = conn.execute(
-                "INSERT INTO cierres_caja (fecha, total, vehiculos_salida) VALUES (?,?,?)",
-                (fecha, total, vehiculos_salida),
+            row = conn.execute(
+                "SELECT 1 FROM cierres_caja WHERE fecha=? LIMIT 1", (fecha,)
+            ).fetchone()
+        return row is not None
+
+    def registrar(
+        self,
+        fecha: str,
+        total: float,
+        vehiculos_salida: int,
+        *,
+        total_horas: float | None = None,
+        cantidad_horas: int | None = None,
+        total_mensualidades: float | None = None,
+        cantidad_mensualidades: int | None = None,
+        inventario_snapshot: list[tuple] | None = None,
+        estado_reporte: EstadoReporte | None = None,
+    ) -> CierreCaja:
+        snapshot = (
+            json.dumps(
+                [list(item) for item in inventario_snapshot],
+                ensure_ascii=False,
+                separators=(",", ":"),
             )
-            id_ = cur.lastrowid
-        return CierreCaja(id_, fecha, total, vehiculos_salida)
+            if inventario_snapshot is not None
+            else None
+        )
+        try:
+            with db.get_connection() as conn:
+                cur = conn.execute(
+                    """INSERT INTO cierres_caja
+                       (fecha, total, vehiculos_salida, total_horas, cantidad_horas,
+                        total_mensualidades, cantidad_mensualidades, inventario_snapshot,
+                        estado_reporte)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (
+                        fecha,
+                        total,
+                        vehiculos_salida,
+                        total_horas,
+                        cantidad_horas,
+                        total_mensualidades,
+                        cantidad_mensualidades,
+                        snapshot,
+                        estado_reporte.value if estado_reporte is not None else None,
+                    ),
+                )
+                id_ = cur.lastrowid
+        except sqlite3.IntegrityError as exc:
+            if (
+                getattr(exc, "sqlite_errorname", None) == "SQLITE_CONSTRAINT_UNIQUE"
+                and "cierres_caja.fecha" in str(exc)
+            ):
+                raise CierreDiarioDuplicadoPersistenceError from exc
+            raise
+        return CierreCaja(
+            id_,
+            fecha,
+            total,
+            vehiculos_salida,
+            total_horas,
+            cantidad_horas,
+            total_mensualidades,
+            cantidad_mensualidades,
+            inventario_snapshot,
+            estado_reporte,
+        )
+
+    def obtener_por_id(self, cierre_id: int) -> CierreCaja | None:
+        with db.get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM cierres_caja WHERE id=?", (cierre_id,)
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            snapshot = (
+                [tuple(item) for item in json.loads(row["inventario_snapshot"])]
+                if row["inventario_snapshot"] is not None
+                else None
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise CierreSnapshotInvalidoPersistenceError from exc
+        try:
+            estado_reporte = (
+                EstadoReporte(row["estado_reporte"])
+                if row["estado_reporte"] is not None
+                else None
+            )
+        except ValueError as exc:
+            raise ValueError("Estado de reporte no válido") from exc
+        return CierreCaja(
+            id=row["id"],
+            fecha=row["fecha"],
+            total=row["total"],
+            vehiculos_salida=row["vehiculos_salida"],
+            total_horas=row["total_horas"],
+            cantidad_horas=row["cantidad_horas"],
+            total_mensualidades=row["total_mensualidades"],
+            cantidad_mensualidades=row["cantidad_mensualidades"],
+            inventario_snapshot=snapshot,
+            estado_reporte=estado_reporte,
+        )
+
+    def actualizar_estado_reporte_condicional(
+        self,
+        cierre_id: int,
+        estado_reporte: EstadoReporte,
+    ) -> bool:
+        if estado_reporte not in (EstadoReporte.GENERADO, EstadoReporte.ERROR):
+            raise ValueError("Transición de estado de reporte no permitida")
+        with db.get_connection() as conn:
+            cursor = conn.execute(
+                """UPDATE cierres_caja SET estado_reporte=?
+                   WHERE id=? AND estado_reporte IN (?, ?)""",
+                (
+                    estado_reporte.value,
+                    cierre_id,
+                    EstadoReporte.PENDIENTE.value,
+                    EstadoReporte.ERROR.value,
+                ),
+            )
+        return cursor.rowcount == 1

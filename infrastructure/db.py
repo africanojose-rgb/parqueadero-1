@@ -28,37 +28,97 @@ def get_connection() -> sqlite3.Connection:
 
 def crear_tablas() -> None:
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """CREATE TABLE IF NOT EXISTS ingresos (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               placa TEXT, tipo TEXT, marca TEXT, propietario TEXT,
-               telefono TEXT, entrada TEXT, salida TEXT,
-               valor_pagado REAL, estado TEXT)"""
-    )
-    cur.execute(
-        """CREATE TABLE IF NOT EXISTS mensualidades (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               placa TEXT, marca TEXT, propietario TEXT, telefono TEXT,
-               tipo TEXT, fecha_pago TEXT, fecha_vencimiento TEXT)"""
-    )
-    cur.execute(
-        """CREATE TABLE IF NOT EXISTS configuracion (
-               tipo_vehiculo TEXT PRIMARY KEY,
-               tarifa_hora REAL, tarifa_mes REAL, cupos_totales INTEGER)"""
-    )
-    cur.execute(
-        """CREATE TABLE IF NOT EXISTS cierres_caja (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               fecha TEXT, total REAL, vehiculos_salida INTEGER)"""
-    )
-    # Migración: asegurar columna tarifa_mes en DBs existentes
-    cur.execute("PRAGMA table_info(configuracion)")
-    columnas = {row["name"] for row in cur.fetchall()}
-    if "tarifa_mes" not in columnas:
-        cur.execute("ALTER TABLE configuracion ADD COLUMN tarifa_mes REAL")
-    conn.commit()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS ingresos (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   placa TEXT, tipo TEXT, marca TEXT, propietario TEXT,
+                   telefono TEXT, entrada TEXT, salida TEXT,
+                   valor_pagado REAL, estado TEXT)"""
+        )
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS mensualidades (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   placa TEXT, marca TEXT, propietario TEXT, telefono TEXT,
+                   tipo TEXT, fecha_pago TEXT, fecha_vencimiento TEXT)"""
+        )
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS configuracion (
+                   tipo_vehiculo TEXT PRIMARY KEY,
+                   tarifa_hora REAL, tarifa_mes REAL, cupos_totales INTEGER)"""
+        )
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS cierres_caja (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   fecha TEXT, total REAL, vehiculos_salida INTEGER)"""
+        )
+
+        cur.execute("PRAGMA table_info(cierres_caja)")
+        columnas_cierre = {row["name"] for row in cur.fetchall()}
+        for columna, tipo in (
+            ("total_horas", "REAL"),
+            ("cantidad_horas", "INTEGER"),
+            ("total_mensualidades", "REAL"),
+            ("cantidad_mensualidades", "INTEGER"),
+            ("inventario_snapshot", "TEXT"),
+            ("estado_reporte", "TEXT"),
+        ):
+            if columna not in columnas_cierre:
+                cur.execute(f"ALTER TABLE cierres_caja ADD COLUMN {columna} {tipo}")
+
+        cierres_duplicados = cur.execute(
+            """SELECT fecha, COUNT(*) AS cantidad, GROUP_CONCAT(id) AS ids
+               FROM cierres_caja
+               GROUP BY fecha
+               HAVING COUNT(*) > 1"""
+        ).fetchall()
+        if cierres_duplicados:
+            detalle = "; ".join(
+                f"fecha={row['fecha']!r}, cantidad={row['cantidad']}, ids={row['ids']}"
+                for row in cierres_duplicados
+            )
+            raise RuntimeError(
+                "No se puede crear la restricción de cierres diarios duplicados: "
+                f"{detalle}. Resuelva los conflictos manualmente sin eliminar datos automáticamente."
+            )
+
+        # Migración: asegurar columna tarifa_mes en DBs existentes
+        cur.execute("PRAGMA table_info(configuracion)")
+        columnas = {row["name"] for row in cur.fetchall()}
+        if "tarifa_mes" not in columnas:
+            cur.execute("ALTER TABLE configuracion ADD COLUMN tarifa_mes REAL")
+
+        duplicados = cur.execute(
+            """SELECT placa, COUNT(*) AS cantidad, GROUP_CONCAT(id) AS ids
+               FROM ingresos
+               WHERE estado=?
+               GROUP BY placa
+               HAVING COUNT(*) > 1""",
+            ("EN SITIO",),
+        ).fetchall()
+        if duplicados:
+            detalle = "; ".join(
+                f"placa={row['placa']!r}, cantidad={row['cantidad']}, ids={row['ids']}"
+                for row in duplicados
+            )
+            raise RuntimeError(
+                "No se puede crear la restricción de ingresos activos duplicados: "
+                f"{detalle}. Resuelva los conflictos manualmente sin eliminar datos automáticamente."
+            )
+
+        cur.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS ux_ingresos_placa_en_sitio
+               ON ingresos(placa)
+               WHERE estado='EN SITIO'"""
+        )
+        cur.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS ux_cierres_caja_fecha
+               ON cierres_caja(fecha)"""
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def sembrar_configuracion() -> None:
